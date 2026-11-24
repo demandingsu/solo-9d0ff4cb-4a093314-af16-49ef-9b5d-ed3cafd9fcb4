@@ -1,12 +1,14 @@
 """端到端业务规则测试（FastAPI TestClient + 临时 SQLite 库）。"""
 from __future__ import annotations
 
+import sqlite3
 import threading
+from datetime import date, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app import main
+from app import main, repository
 from app.database import connect, initialize
 
 
@@ -310,3 +312,138 @@ def test_interval_merging_adjacent_segments(client):
     assert data["confirmed_no_screening"] == [
         {"start_date": "2026-07-01", "end_date": "2026-07-05"}
     ]
+
+
+def _seed_daily_manifests(client, n: int, start: str = "2026-01-01") -> str:
+    """写入 n 份逐日相邻、互不交叠的清单：偶数日有一场，奇数日为空清单。"""
+    base = date.fromisoformat(start)
+    for i in range(n):
+        day = (base + timedelta(days=i)).isoformat()
+        screenings = [[day, 1, f"片{i}"]] if i % 2 == 0 else []
+        _post(client, _manifest(100 + i, day, day, screenings))
+    return (base + timedelta(days=n - 1)).isoformat()
+
+
+def _seed_daily_manifests_empty(client, start: str, n: int) -> None:
+    """写入 n 份逐日相邻、互不交叠的空清单（各自独立版次）。"""
+    base = date.fromisoformat(start)
+    for i in range(n):
+        day = (base + timedelta(days=i)).isoformat()
+        _post(client, _manifest(50 + i, day, day, []))
+
+
+def test_schedule_beyond_sqlite_variable_limit_returns_200(client, monkeypatch):
+    """生效清单 id 数超过 SQLite 单查询变量上限时，/schedule 仍完整返回。
+
+    旧实现把全部清单 id 拼进一条 IN(?, ...) 查询，会触发
+    sqlite3.OperationalError: too many SQL variables（经 API 表现为 500）。
+    """
+    n_days = 40
+    last_day = _seed_daily_manifests(client, n_days)
+
+    # 把该应用所有请求连接的单语句变量上限压低，并把每批 id 数压小，
+    # 强制场次读取走多批查询（每批 7 个 id + 2 个日期参数 = 9 个变量）
+    real_connect = main.connect
+
+    def limited_connect(db_path):
+        conn = real_connect(db_path)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 32)
+        return conn
+
+    monkeypatch.setattr(main, "connect", limited_connect)
+    monkeypatch.setattr(repository, "_max_id_placeholders", lambda conn: 7)
+
+    data = _schedule(client, "2026-01-01", last_day)
+    # 偶数日（0、2、…、38）共 20 场，全部读回且按日期排序
+    assert len(data["screenings"]) == n_days // 2
+    assert [s["date"] for s in data["screenings"]] == sorted(
+        s["date"] for s in data["screenings"]
+    )
+    assert {s["version"] for s in data["screenings"]} == {
+        100 + i for i in range(0, n_days, 2)
+    }
+    # 奇数日各自为确认无放映；它们虽落在不同读取批次，但相邻同类空档必须合并。
+    # 逐日格局为「有场、空、有场、空…」，每个空日两侧都有场次，故共 20 个单日段。
+    assert len(data["confirmed_no_screening"]) == n_days // 2
+    assert all(
+        seg["start_date"] == seg["end_date"]
+        for seg in data["confirmed_no_screening"]
+    )
+    assert data["no_manifest_yet"] == []
+
+
+def test_chunked_reads_merge_adjacent_empty_days_across_batch_boundary(
+    client, monkeypatch
+):
+    """分批读场次时，跨越批次边界的相邻同类空档仍合成一段。"""
+    # 8 个连续空日（8 份同版不相交的空清单），每批 3 个 id -> 跨 3 批
+    _seed_daily_manifests_empty(client, "2026-08-01", 8)
+    monkeypatch.setattr(repository, "_max_id_placeholders", lambda conn: 3)
+
+    data = _schedule(client, "2026-08-01", "2026-08-08")
+    assert data["screenings"] == []
+    # 8 个相邻空日必须合并成一段，而不是按批次切成多段
+    assert data["confirmed_no_screening"] == [
+        {"start_date": "2026-08-01", "end_date": "2026-08-08"}
+    ]
+    assert data["no_manifest_yet"] == []
+
+
+def test_chunked_schedule_reads_remain_snapshot_consistent_under_concurrent_ingest(
+    client, monkeypatch
+):
+    """查档分批读取期间补录照常提交，整份响应始终来自同一个已提交快照。"""
+    # 初始：30 份逐日清单，每天一场“旧”
+    _post(
+        client,
+        _manifest(1, "2026-09-01", "2026-09-30", []),
+    )
+    for i in range(30):
+        day = (date(2026, 9, 1) + timedelta(days=i)).isoformat()
+        _post(client, _manifest(100 + i, day, day, [[day, 1, "旧"]]))
+    # 每批仅 4 个 id，单次 /schedule 的场次读取被切成多批
+    monkeypatch.setattr(repository, "_max_id_placeholders", lambda conn: 4)
+
+    stop = threading.Event()
+    errors: list[str] = []
+
+    def reader() -> None:
+        while not stop.is_set():
+            data = _schedule(client, "2026-09-01", "2026-09-30")
+            titles = {s["title"] for s in data["screenings"]}
+            # 分批之间若混入不同已提交状态，会同时出现“旧”和“新”——绝不允许
+            if titles not in ({"旧"}, {"新"}):
+                errors.append(f"混合态快照: {sorted(titles)}")
+                return
+            # 同一快照内每天至多一场，且场次总数只可能是 0 或 30
+            if len(data["screenings"]) not in (0, 30):
+                errors.append(f"场次数量异常: {len(data['screenings'])}")
+                return
+
+    t = threading.Thread(target=reader)
+    t.start()
+    try:
+        for _ in range(15):
+            # 高版次整窗覆盖：全部 30 天的生效清单切到 v2，场次改名为“新”
+            client.post(
+                "/manifests",
+                json=_manifest(
+                    2,
+                    "2026-09-01",
+                    "2026-09-30",
+                    [
+                        [(date(2026, 9, 1) + timedelta(days=i)).isoformat(), 1, "新"]
+                        for i in range(30)
+                    ],
+                ),
+            )
+            # 同版冲突回滚穿插其中，读者也只能看到已提交状态
+            conflict = client.post(
+                "/manifests",
+                json=_manifest(2, "2026-09-20", "2026-09-25", [["2026-09-21", 1, "冲突"]]),
+            )
+            assert conflict.status_code == 409
+    finally:
+        stop.set()
+        t.join()
+    assert errors == []

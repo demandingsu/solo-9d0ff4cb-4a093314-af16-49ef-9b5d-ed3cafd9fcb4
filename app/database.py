@@ -61,10 +61,16 @@ class SameVersionConflict(Exception):
 
 
 def connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
-    """打开一个带行工厂和并发设置的连接（不自动开启事务）。"""
+    """打开一个带行工厂和并发设置的连接（不自动开启事务）。
+
+    ``check_same_thread=False``：FastAPI 在线程池中分派同步端点，
+    依赖注入生成器的收尾（``conn.close()``）可能与建连不在同一工作线程；
+    本应用每请求独占一个连接、事务由服务层显式串行管理，配合 SQLite
+    默认的序列化线程模式即可安全跨线程收尾。
+    """
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30)
+    conn = sqlite3.connect(str(path), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout={30_000}")
     conn.execute("PRAGMA journal_mode=WAL")

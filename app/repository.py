@@ -6,6 +6,11 @@
 3. ``no_manifest_yet``        —— 没有任何清单覆盖到的日期段。
 
 全程区间运算，不逐日展开；读操作在单条快照事务内完成。
+
+生效清单可能成千上万，单条 ``IN (?, ?, ...)`` 查询会撞上 SQLite 的单语句
+变量上限（``SQLITE_LIMIT_VARIABLE_NUMBER``，旧版本仅 999）。因此读场次时
+按该上限把清单 id 切成多批，每批仍是一条按日期区间限定的批量查询，
+全部批次共用同一条快照事务，逐批读回的结果与一次性读回完全等价。
 """
 from __future__ import annotations
 
@@ -15,6 +20,27 @@ from datetime import date
 from . import intervals as iv
 from .database import snapshot
 from .schemas import DateInterval, ScheduleResponse, ScreeningOut
+
+# 每条场次查询除 manifest id 占位符外，还需绑定查询窗口的起止两个日期参数
+_DATE_BOUND_PARAMS = 2
+# 无法探测运行时上限时的保守兜底值（兼容 SQLITE_MAX_VARIABLE_NUMBER=999 的旧库）
+_FALLBACK_VARIABLE_LIMIT = 999
+
+
+def _max_id_placeholders(conn: sqlite3.Connection) -> int:
+    """当前连接每条 SQL 允许的最大绑定变量数（减去日期窗口占用的两个参数）。"""
+    getlimit = getattr(conn, "getlimit", None)
+    if getlimit is None:
+        limit = _FALLBACK_VARIABLE_LIMIT
+    else:
+        limit = int(getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER))
+    return max(1, limit - _DATE_BOUND_PARAMS)
+
+
+def _chunked(items: list[int], size: int):
+    """把列表按固定大小切成多段（size >= 1）。"""
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 def _load_manifests(
@@ -46,24 +72,32 @@ def _load_screenings(
     q_start_iso: str,
     q_end_iso: str,
 ) -> dict[int, list[tuple[str, int, str]]]:
+    """批量读回各生效清单在查询窗口内的场次，按 manifest id 分组。
+
+    清单 id 按 SQLite 单语句变量上限切段：每段一条区间限定的批量查询，
+    既不逐日展开、也不逐段（生效区间）查库；调用方须保证本函数运行在
+    单条快照事务内，使所有批次读到同一个已提交状态。
+    """
     if not manifest_ids:
         return {}
-    placeholders = ",".join("?" for _ in manifest_ids)
-    rows = conn.execute(
-        f"""
-        SELECT manifest_id, date, session_no, title
-        FROM screenings
-        WHERE manifest_id IN ({placeholders})
-          AND date >= ? AND date <= ?
-        ORDER BY date, session_no
-        """,
-        (*manifest_ids, q_start_iso, q_end_iso),
-    ).fetchall()
+    batch_size = _max_id_placeholders(conn)
     grouped: dict[int, list[tuple[str, int, str]]] = {}
-    for r in rows:
-        grouped.setdefault(r["manifest_id"], []).append(
-            (r["date"], r["session_no"], r["title"])
-        )
+    for id_batch in _chunked(manifest_ids, batch_size):
+        placeholders = ",".join("?" for _ in id_batch)
+        rows = conn.execute(
+            f"""
+            SELECT manifest_id, date, session_no, title
+            FROM screenings
+            WHERE manifest_id IN ({placeholders})
+              AND date >= ? AND date <= ?
+            ORDER BY date, session_no
+            """,
+            (*id_batch, q_start_iso, q_end_iso),
+        ).fetchall()
+        for r in rows:
+            grouped.setdefault(r["manifest_id"], []).append(
+                (r["date"], r["session_no"], r["title"])
+            )
     return grouped
 
 

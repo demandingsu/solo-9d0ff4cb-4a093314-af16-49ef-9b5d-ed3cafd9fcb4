@@ -81,6 +81,12 @@ uvicorn app.main:app --reload
 - `confirmed_no_screening`：已被清单覆盖、但生效清单确认当天无放映的日期段；
 - `no_manifest_yet`：还没有任何清单覆盖到的日期段。
 
+生效清单数量超过 SQLite 单条查询的绑定变量上限（旧版
+`SQLITE_MAX_VARIABLE_NUMBER=999`）时，场次读取会按运行时上限把清单 id
+自动切成多批：每批仍是一条按日期区间限定的批量查询（不逐日展开、不逐段查库），
+所有批次共用同一条快照事务，结果与一次性读回完全等价；跨批次的相邻同类空档
+仍合并为一段。
+
 另有 `GET /manifests`（已入库清单）与 `GET /healthz`（健康检查）。
 
 ## 测试
